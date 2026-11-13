@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quant-eval"
+version = "0.1.0"
+description = "A reproducible framework for downloading and evaluating quantized language models"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.0", "transformers>=4.38", "accelerate>=0.27", "datasets>=2.16", "huggingface_hub>=0.20"]
+
+[project.optional-dependencies]
+modelscope = ["modelscope>=1.11"]
+gguf = ["llama-cpp-python>=0.2.50"]
+
+[project.scripts]
+quant-eval = "quant_eval.cli:main"
+download-model = "quant_eval.download:main"
+evaluate-model = "quant_eval.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["quant_eval*"]
