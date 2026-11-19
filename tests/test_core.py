@@ -3,7 +3,7 @@ import unittest
 
 from quant_eval.download import parse_model_source
 from quant_eval.runner import (
-    _gguf_candidate_nll, _gguf_ppl, _lifebench_score, _mmlu_prompt, _word_count,
+    _gguf_ppl, _lifebench_score, _word_count,
 )
 
 
@@ -33,14 +33,6 @@ class CoreTests(unittest.TestCase):
                 parsed = parse_model_source(source)
                 self.assertEqual((parsed.provider, parsed.repo_id), expected)
 
-    def test_mmlu_prompt(self):
-        prompt, choices, answer = _mmlu_prompt({
-            "question": "Pick one", "options": ["left", "right"],
-            "answer": "B", "category": "other",
-        })
-        self.assertIn("A. left\nB. right\nAnswer:", prompt)
-        self.assertEqual((len(choices), answer), (2, 1))
-
     def test_lifebench_reference_formula(self):
         self.assertEqual(_word_count("中文 abc-def O'Reilly"), 4)
         deviation, score = _lifebench_score(50, 100, "equal to")
@@ -53,11 +45,6 @@ class CoreTests(unittest.TestCase):
         nll, tokens = _gguf_ppl(FakeLlama(), None, "abcde", 4, 2)
         self.assertEqual(tokens, 4)
         self.assertAlmostEqual(nll, 4 * math.log(4))
-
-    def test_gguf_answer_likelihood(self):
-        self.assertAlmostEqual(_gguf_candidate_nll(FakeLlama(), "Answer:", "A"),
-                               2 * math.log(4))
-
 
 if __name__ == "__main__":
     unittest.main()

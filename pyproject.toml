@@ -7,12 +7,12 @@ name = "quant-eval"
 version = "0.1.0"
 description = "A reproducible framework for downloading and evaluating quantized language models"
 requires-python = ">=3.9"
-dependencies = ["torch>=2.0", "transformers>=4.38", "accelerate>=0.27", "datasets>=2.16", "huggingface_hub>=0.20"]
+dependencies = ["torch>=2.0", "transformers>=4.38", "accelerate>=0.27", "datasets>=2.16", "huggingface_hub>=0.20", "lm_eval[hf]==0.4.13"]
 
 [project.optional-dependencies]
 modelscope = ["modelscope>=1.11"]
 gguf = ["llama-cpp-python>=0.2.50"]
-ifeval = ["lm_eval[hf,ifeval]>=0.4.13,<0.5"]
+ifeval = ["lm_eval[ifeval]==0.4.13"]
 inference = ["nvidia-ml-py>=12"]
 
 [project.scripts]

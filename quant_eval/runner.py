@@ -1,9 +1,7 @@
 """Benchmark runner for WikiText-2 PPL, MMLU-Pro and LIFEBench.
 
-The runner deliberately keeps benchmark implementations in this package rather
-than hiding them behind a third party evaluation harness.  This makes the
-dataset revisions, prompt format and numerical settings visible in every JSON
-result file.
+WikiText-2 and LIFEBench use local implementations. MMLU-Pro uses the stock
+LM Evaluation Harness 5-shot CoT task and records its protocol in the result.
 """
 
 from __future__ import annotations
@@ -19,6 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
+
+from .mmlu_pro import evaluate_mmlu_pro
 
 
 WIKITEXT_CONFIG = {
@@ -177,92 +177,6 @@ def evaluate_wikitext(model, tokenizer, device: str, backend: str, max_samples: 
     bpb = nll / math.log(2) / max(1, len(text.encode("utf-8")))
     return {**WIKITEXT_CONFIG, "context_length": context_length, "stride": stride,
             "tokens": tokens, "nll": nll, "ppl": math.exp(nll / tokens), "bpb": bpb}
-
-
-def _answer_index(answer: Any, choices: list[str]) -> int:
-    if isinstance(answer, int):
-        return answer
-    value = str(answer).strip().upper()
-    if value in "ABCDEFGHIJ":
-        return "ABCDEFGHIJ".index(value)
-    if value.isdigit() and int(value) < len(choices):
-        return int(value)
-    return choices.index(answer) if answer in choices else -1
-
-
-def _mmlu_prompt(row: dict[str, Any]) -> tuple[str, list[str], int]:
-    choices = row.get("options", row.get("choices"))
-    if isinstance(choices, str):
-        choices = json.loads(choices)
-    choices = list(choices or [])
-    question = str(row.get("question", row.get("prompt", "")))
-    lines = [question]
-    for i, choice in enumerate(choices):
-        lines.append(f"{chr(65 + i)}. {choice}")
-    lines.append("Answer:")
-    answer = row.get("answer", row.get("label"))
-    if answer is None:
-        answer = row.get("answer_index")
-    return "\n".join(lines), choices, _answer_index(answer, choices)
-
-
-def _candidate_nll(model, tokenizer, device: str, prompt: str, candidate: str) -> float:
-    import torch
-    full = tokenizer(prompt + " " + candidate, return_tensors="pt", add_special_tokens=False)
-    pids = tokenizer(prompt, return_tensors="pt", add_special_tokens=False).input_ids
-    input_ids = full.input_ids.to(device)
-    labels = input_ids.clone()
-    labels[:, : pids.shape[1]] = -100
-    with torch.inference_mode():
-        out = model(input_ids, labels=labels)
-    return float(out.loss.item() * (labels != -100).sum().item())
-
-
-def _gguf_candidate_nll(llama, prompt: str, candidate: str) -> float:
-    import numpy as np
-    continuation = " " + candidate
-    answer_ids = llama.tokenize(continuation.encode("utf-8"), add_bos=False)
-    full_ids = llama.tokenize((prompt + continuation).encode("utf-8"), add_bos=True)
-    if len(answer_ids) == 0 or len(answer_ids) > len(full_ids) - 1:
-        return float("inf")
-    llama.reset()
-    llama.eval(full_ids)
-    logits = np.asarray(_gguf_scores(llama))
-    nll = 0.0
-    first_answer = len(full_ids) - len(answer_ids)
-    for i in range(first_answer, len(full_ids)):
-        row = logits[i - 1]
-        m = float(row.max())
-        nll += m + math.log(float(np.exp(row - m).sum())) - float(row[full_ids[i]])
-    return nll
-
-
-def evaluate_mmlu_pro(model, tokenizer, device: str, backend: str = "transformers",
-                      max_samples: int | None = None) -> dict[str, Any]:
-    from datasets import load_dataset
-    ds = load_dataset("TIGER-Lab/MMLU-Pro", split="test")
-    if max_samples:
-        ds = ds.select(range(min(max_samples, len(ds))))
-    correct = 0
-    by_category: dict[str, list[int]] = {}
-    for row in ds:
-        prompt, choices, answer = _mmlu_prompt(dict(row))
-        if answer < 0 or not choices:
-            continue
-        score = _gguf_candidate_nll if backend == "gguf" else None
-        losses = [(score(model, prompt, chr(65 + i)) if score else
-                   _candidate_nll(model, tokenizer, device, prompt, chr(65 + i)))
-                  for i in range(len(choices))]
-        predicted = min(range(len(losses)), key=losses.__getitem__)
-        hit = int(predicted == answer)
-        correct += hit
-        category = str(row.get("category", "all"))
-        by_category.setdefault(category, []).append(hit)
-    total = sum(len(v) for v in by_category.values())
-    return {"dataset": "TIGER-Lab/MMLU-Pro", "split": "test", "method": "zero-shot direct likelihood",
-            "samples": total,
-            "accuracy": correct / total if total else None,
-            "category_accuracy": {k: sum(v) / len(v) for k, v in sorted(by_category.items())}}
 
 
 def _find_first(row: dict[str, Any], names: Iterable[str], default: Any = None):

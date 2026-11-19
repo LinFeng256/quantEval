@@ -65,13 +65,15 @@ evaluate-model ./models/qwen --gpu 0 \
 
 ### MMLU-Pro
 
-使用 `TIGER-Lab/MMLU-Pro` 的 `test` split，对 A–J 选项计算答案 continuation 的 loss（direct、无采样），输出总体准确率和按 `category` 分组的准确率。该结果对应 direct 评测；如果要复现官方 CoT 排名，需要把生成式 CoT 提示和答案解析作为单独配置加入。
+使用 LM Evaluation Harness 0.4.13 的原生 `mmlu_pro` 任务和 `TIGER-Lab/MMLU-Pro` 的 `test` split，与当前 Qwen3 评测采用同一 5-shot CoT 配置：从 `validation` 每科取前 5 条示例、文本提示 `Let's think step by step`、不应用 chat template、batch size 1、greedy（`do_sample=False`、`temperature=0`），最多生成 2048 tokens，遇到 `Question:` 停止。按 Harness 的 `exact_match,custom-extract` 解析答案，以有效题数加权汇总 14 科准确率。未显式设置 Qwen3 的 thinking 开关。
+
+`--max-samples N` 在 MMLU-Pro 中表示每科最多 N 题；正式全量结果不要使用该选项。
 
 ### LIFEBench
 
 使用官方 `LIFEBench/LIFEBench` 的 `main` split，默认展开 10 个长度约束（16 到 8192）和 `equal to` 控制方式。固定 `do_sample=False`，按官方指数评分计算 `length_deviation`（绝对百分比）与 `length_score`。可用 `--lifebench-controls "equal to" "at most" "at least"` 运行三种控制方式，或用 `--lifebench-lengths 16 128 1024` 缩小范围。
 
-GGUF 通过 `llama-cpp-python` 使用模型自带 tokenizer，三项 benchmark 均可运行；MMLU-Pro 使用候选答案 likelihood，LIFEBench 使用确定性 greedy generation。若要使用 Transformers 的量化 checkpoint，则传入包含 `config.json` 和 tokenizer 文件的模型目录。
+GGUF 通过 `llama-cpp-python` 使用模型自带 tokenizer，三项 benchmark 均可运行；MMLU-Pro 通过 Harness 原生任务构造题目和评分，GGUF 生成走 llama.cpp，LIFEBench 使用确定性 greedy generation。若要使用 Transformers 的量化 checkpoint，则传入包含 `config.json` 和 tokenizer 文件的模型目录。
 
 GGUF 默认分配 16384 token context；长输入或长输出模型可用 `--gguf-n-ctx 32768` 调整。`--max-new-tokens` 默认 8192，8192 词约束通常需要更大的生成上限，否则 LIFEBench 长度分数会受到截断影响。
 
@@ -109,6 +111,8 @@ benchmark-inference ./models/qwen --gpu 2 --case 512:256 --warmup 0 --repeats 1
 默认测试 `512->256`、`4096->512`、`8192->1024`、`16384->1024`、`32768->1024`、`4096->4096`，每组独立进程加载模型，预热 1 次、正式重复 3 次。单路请求、greedy，输入是固定文本截取出的精确 token 数，生成时忽略 EOS 以保证输出 token 数固定；不计 tokenizer 与模型加载时间。
 
 HF 后端显式使用 `flash_attention_2`、FP16 模型计算与 FP16 K/V cache，并在运行时检查实际 cache dtype。GGUF 后端使用 CUDA 版 llama.cpp、`flash_attn=True`、`type_k=type_v=GGML_TYPE_F16`，模型所有层放在指定 GPU。无法满足这些条件时该组会报错，不会静默切换后端。模型需支持输入加输出的总上下文长度，最长一组为 33792 tokens。
+
+已有 GPTQModel + humming 加载脚本时，可传 `--backend humming --humming-loader /path/to/loader.py`；加载脚本须导出 `load_humming_model("gptq3", model_path)` 并返回 `(model, owner)`。`--attention-backend sdpa-flash` 使用 PyTorch SDPA 并强制只允许 Flash Attention 内核，适用于未安装 `flash-attn` 包的环境；也可用于普通 Transformers checkpoint。若设备或模型不支持该内核，测试会报错，不会回退到其他 attention 内核。
 
 输出 JSON 每组包含 `ttft_ms`（从预填充开始到首 token 就绪）、`decode_tokens_per_s`（剩余输出 token 数除以解码时间）、`peak_memory_gib`（NVML 每 20ms 采样本进程的显存，包括模型和 KV cache）。时间取重复测量的中位数，显存取该组全过程峰值。失败的组记录 `status=error` 并继续其他组；只要有失败，命令最终返回非零退出码。GGUF 的 KV cache 按该组上下文长度分配，因此显存结果包含其预分配容量。
 

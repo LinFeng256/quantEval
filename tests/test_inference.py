@@ -136,6 +136,33 @@ class InferenceTests(unittest.TestCase):
             self.assertTrue(all(gpu == "2" for _, gpu in seen))
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), result)
 
+    def test_humming_worker_receives_loader_and_flash_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory) / "model"
+            model.mkdir()
+            (model / "config.json").write_text("{}", encoding="utf-8")
+            loader = Path(directory) / "loader.py"
+            loader.touch()
+            commands = []
+
+            def fake_run(command, **kwargs):
+                commands.append(command)
+                result_file = Path(command[command.index("--worker-output") + 1])
+                result_file.write_text('{"status": "ok"}', encoding="utf-8")
+                return SimpleNamespace(returncode=0, stderr="")
+
+            with patch("quant_eval.inference.subprocess.run", side_effect=fake_run):
+                result = benchmark_inference(
+                    str(model), cases=((512, 256),), backend_override="humming",
+                    humming_loader=str(loader), attention_backend="sdpa-flash",
+                )
+            self.assertTrue(result["completed"])
+            self.assertEqual(result["backend"], "humming")
+            self.assertEqual(result["settings"]["attention_backend"], "sdpa-flash")
+            self.assertEqual(commands[0][commands[0].index("--humming-loader") + 1], str(loader))
+            self.assertEqual(commands[0][commands[0].index("--backend") + 1], "humming")
+            self.assertEqual(commands[0][commands[0].index("--attention-backend") + 1], "sdpa-flash")
+
     def test_failed_case_is_recorded_and_next_case_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             model = Path(directory) / "model.gguf"

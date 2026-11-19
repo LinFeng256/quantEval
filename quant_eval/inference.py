@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import importlib.util
 import json
 import os
 import re
@@ -152,8 +154,10 @@ def _assert_fp16_cache(cache: Any, torch: Any) -> None:
 
 
 def _run_hf_once(model: Any, prompt: Any, output_tokens: int, torch: Any,
-                 check_cache: bool = False) -> tuple[float, float]:
-    with torch.inference_mode():
+                 check_cache: bool = False, attention_backend: str = "flash_attention_2") -> tuple[float, float]:
+    attention = (torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.FLASH_ATTENTION)
+                 if attention_backend == "sdpa-flash" else contextlib.nullcontext())
+    with torch.inference_mode(), attention:
         torch.cuda.synchronize()
         start = time.perf_counter()
         outputs = model(input_ids=prompt, use_cache=True)
@@ -189,7 +193,7 @@ def _run_llama_once(llama: Any, prompt: list[int], output_tokens: int) -> tuple[
     return first - start, end - first
 
 
-def _load_hf(path: Path) -> tuple[Any, Any, Any]:
+def _load_hf(path: Path, attention_backend: str = "flash_attention_2") -> tuple[Any, Any, Any]:
     try:
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -199,14 +203,42 @@ def _load_hf(path: Path) -> tuple[Any, Any, Any]:
         raise RuntimeError("CUDA is required for FlashAttention-2 inference")
     torch.cuda.set_device(0)
     tokenizer = AutoTokenizer.from_pretrained(str(path), trust_remote_code=True)
+    implementation = "sdpa" if attention_backend == "sdpa-flash" else "flash_attention_2"
     model = AutoModelForCausalLM.from_pretrained(
-        str(path), torch_dtype=torch.float16, attn_implementation="flash_attention_2",
+        str(path), torch_dtype=torch.float16, attn_implementation=implementation,
         device_map={"": "cuda:0"}, trust_remote_code=True,
     )
-    if getattr(model.config, "_attn_implementation", None) != "flash_attention_2":
-        raise RuntimeError("model did not activate FlashAttention-2")
+    if getattr(model.config, "_attn_implementation", None) != implementation:
+        raise RuntimeError(f"model did not activate {implementation} attention")
     model.eval()
     return model, tokenizer, torch
+
+
+def _load_humming(path: Path, loader_path: str, attention_backend: str) -> tuple[Any, Any, Any]:
+    try:
+        import torch
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError("humming inference requires torch and transformers") from exc
+    loader_file = Path(loader_path).expanduser().resolve()
+    if not loader_file.is_file():
+        raise ValueError(f"humming loader file does not exist: {loader_file}")
+    spec = importlib.util.spec_from_file_location("quant_eval_humming_loader", loader_file)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import humming loader: {loader_file}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required for humming inference")
+    torch.cuda.set_device(0)
+    model, owner = module.load_humming_model("gptq3", path)
+    implementation = "sdpa" if attention_backend == "sdpa-flash" else "flash_attention_2"
+    model.set_attn_implementation(implementation)
+    if getattr(model.config, "_attn_implementation", None) != implementation:
+        raise RuntimeError(f"humming model did not activate {implementation} attention")
+    tokenizer = AutoTokenizer.from_pretrained(str(path), local_files_only=True)
+    model.eval()
+    return model, tokenizer, (torch, owner)
 
 
 def _load_gguf(path: Path, context_tokens: int) -> Any:
@@ -225,21 +257,35 @@ def _load_gguf(path: Path, context_tokens: int) -> Any:
 
 
 def measure_case(model_path: str, gpu: int, input_tokens: int, output_tokens: int,
-                 warmup: int = 1, repeats: int = 3) -> dict[str, Any]:
+                 warmup: int = 1, repeats: int = 3, backend_override: str = "auto",
+                 humming_loader: str | None = None,
+                 attention_backend: str = "flash_attention_2") -> dict[str, Any]:
     path, backend = _resolve_model(model_path)
+    if backend_override == "humming":
+        if backend != "transformers" or not humming_loader:
+            raise ValueError("humming requires a Transformers checkpoint and --humming-loader")
+        backend = "humming"
+    if attention_backend not in ("flash_attention_2", "sdpa-flash"):
+        raise ValueError("unsupported attention backend")
     if gpu < 0 or input_tokens < 1 or output_tokens < 2 or warmup < 0 or repeats < 1:
         raise ValueError("gpu >= 0, input_tokens >= 1, output_tokens >= 2, warmup >= 0 and repeats >= 1 are required")
     # CUDA visibility must be set before either backend initializes CUDA.
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
     with PeakGpuMemory(gpu) as memory:
-        if backend == "transformers":
-            model, tokenizer, torch = _load_hf(path)
+        if backend in ("transformers", "humming"):
+            if backend == "humming":
+                model, tokenizer, (torch, owner) = _load_humming(path, humming_loader, attention_backend)
+            else:
+                model, tokenizer, torch = _load_hf(path, attention_backend)
             ids = _prompt_ids(lambda text: tokenizer.encode(text, add_special_tokens=False), input_tokens)
             prompt = torch.tensor([ids], dtype=torch.long, device="cuda:0")
             short_prompt = prompt[:, :min(input_tokens, 128)]
             for _ in range(warmup):
-                _run_hf_once(model, short_prompt, min(output_tokens, 8), torch, check_cache=True)
-            runs = [_run_hf_once(model, prompt, output_tokens, torch, check_cache=(i == 0 and warmup == 0))
+                _run_hf_once(model, short_prompt, min(output_tokens, 8), torch,
+                             check_cache=True, attention_backend=attention_backend)
+            runs = [_run_hf_once(model, prompt, output_tokens, torch,
+                                 check_cache=(i == 0 and warmup == 0),
+                                 attention_backend=attention_backend)
                     for i in range(repeats)]
         else:
             llama = _load_gguf(path, input_tokens + output_tokens)
@@ -270,8 +316,16 @@ def _write_result(result: dict[str, Any], output: str | None) -> None:
 
 def benchmark_inference(model_path: str, gpu: str = "0", output: str | None = None,
                         cases: tuple[tuple[int, int], ...] = CASES,
-                        warmup: int = 1, repeats: int = 3) -> dict[str, Any]:
+                        warmup: int = 1, repeats: int = 3, backend_override: str = "auto",
+                        humming_loader: str | None = None,
+                        attention_backend: str = "flash_attention_2") -> dict[str, Any]:
     path, backend = _resolve_model(model_path)
+    if backend_override == "humming":
+        if backend != "transformers" or not humming_loader:
+            raise ValueError("humming requires a Transformers checkpoint and --humming-loader")
+        backend = "humming"
+    if attention_backend not in ("flash_attention_2", "sdpa-flash"):
+        raise ValueError("unsupported attention backend")
     if not gpu.isdigit():
         raise ValueError("--gpu must be a physical NVIDIA GPU index")
     if not cases or warmup < 0 or repeats < 1 or any(a < 1 or b < 2 for a, b in cases):
@@ -279,6 +333,7 @@ def benchmark_inference(model_path: str, gpu: str = "0", output: str | None = No
     result: dict[str, Any] = {
         "model": str(path), "gpu": int(gpu), "backend": backend, "timestamp": time.time(),
         "settings": {"batch_size": 1, "sampling": "greedy", "flash_attention": True,
+                     "attention_backend": attention_backend,
                      "kv_cache_k": "f16", "kv_cache_v": "f16",
                      "memory_source": "NVML per-process usedGpuMemory",
                      "memory_poll_interval_ms": 20, "warmup": warmup, "repeats": repeats},
@@ -292,7 +347,10 @@ def benchmark_inference(model_path: str, gpu: str = "0", output: str | None = No
             command = [sys.executable, "-m", "quant_eval.inference", "--worker-case",
                        str(input_tokens), str(output_tokens), str(path), "--gpu", gpu,
                        "--warmup", str(warmup), "--repeats", str(repeats),
+                       "--backend", backend_override, "--attention-backend", attention_backend,
                        "--worker-output", str(case_file)]
+            if humming_loader:
+                command.extend(["--humming-loader", humming_loader])
             environment = os.environ.copy()
             environment["CUDA_VISIBLE_DEVICES"] = gpu
             process = subprocess.run(command, env=environment, stdout=subprocess.DEVNULL,
@@ -321,6 +379,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="run only selected case(s); default runs all six")
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--repeats", type=int, default=3)
+    parser.add_argument("--backend", choices=("auto", "humming"), default="auto")
+    parser.add_argument("--humming-loader", help="Python file exporting load_humming_model(kind, path)")
+    parser.add_argument("--attention-backend", choices=("flash_attention_2", "sdpa-flash"),
+                        default="flash_attention_2")
     parser.add_argument("--worker-case", type=int, nargs=2, help=argparse.SUPPRESS)
     parser.add_argument("--worker-output", help=argparse.SUPPRESS)
     return parser
@@ -347,11 +409,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.worker_case is not None:
         if not args.worker_output:
             raise ValueError("worker output path is required")
-        row = measure_case(args.model, int(args.gpu), *args.worker_case, args.warmup, args.repeats)
+        row = measure_case(args.model, int(args.gpu), *args.worker_case, args.warmup,
+                           args.repeats, args.backend, args.humming_loader,
+                           args.attention_backend)
         _write_result(row, args.worker_output)
         return 0
     cases = _parse_cases(args.case)
-    result = benchmark_inference(args.model, args.gpu, args.output, cases, args.warmup, args.repeats)
+    result = benchmark_inference(args.model, args.gpu, args.output, cases, args.warmup,
+                                 args.repeats, args.backend, args.humming_loader,
+                                 args.attention_backend)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0 if result["completed"] else 1
 
