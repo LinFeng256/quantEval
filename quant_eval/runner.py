@@ -277,13 +277,16 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
              output: str | None = None, max_samples: int | None = None,
              dtype: str = "auto", context_length: int = 2048, stride: int = 1024,
              max_new_tokens: int = 8192, lifebench_lengths: list[int] | None = None,
-             lifebench_controls: list[str] | None = None, gguf_n_ctx: int = 16384) -> dict[str, Any]:
+             lifebench_controls: list[str] | None = None, gguf_n_ctx: int = 16384,
+             mmlu_thinking: str = "off") -> dict[str, Any]:
     if max_samples is not None and max_samples < 1:
         raise ValueError("max_samples must be positive")
     if max_new_tokens < 1:
         raise ValueError("max_new_tokens must be positive")
     if gguf_n_ctx < 2:
         raise ValueError("gguf_n_ctx must be >= 2")
+    if mmlu_thinking not in {"off", "on"}:
+        raise ValueError("mmlu_thinking must be 'off' or 'on'")
     benchmarks = benchmarks or ["wikitext", "mmlu-pro", "lifebench"]
     other_benchmarks = [name for name in benchmarks if name.lower().replace("_", "-") != "ifeval"]
     device = _device(gpu)
@@ -310,7 +313,9 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
             result["benchmarks"]["wikitext-2-ppl"] = evaluate_wikitext(
                 model, tokenizer, device, backend, max_samples, context_length, stride)
         elif key in {"mmlu", "mmlu-pro"}:
-            result["benchmarks"]["mmlu-pro"] = evaluate_mmlu_pro(model, tokenizer, device, backend, max_samples)
+            result["benchmarks"]["mmlu-pro"] = evaluate_mmlu_pro(
+                model, tokenizer, device, backend, max_samples,
+                thinking=mmlu_thinking == "on")
         elif key in {"life", "lifebench"}:
             result["benchmarks"]["lifebench"] = evaluate_lifebench(
                 model, tokenizer, device, backend, max_samples, max_new_tokens,
@@ -336,6 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stride", type=int, default=1024)
     p.add_argument("--max-new-tokens", type=int, default=8192)
     p.add_argument("--gguf-n-ctx", type=int, default=16384, help="GGUF context allocation")
+    p.add_argument("--mmlu-thinking", choices=["off", "on"], default="off",
+                   help="explicit native Thinking mode for MMLU-Pro")
     p.add_argument("--lifebench-lengths", type=int, nargs="+",
                    default=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192],
                    help="LIFEBench word constraints")
@@ -348,7 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = evaluate(args.model, args.gpu, args.benchmarks, args.output, args.max_samples,
                       args.dtype, args.context_length, args.stride, args.max_new_tokens,
-                      args.lifebench_lengths, args.lifebench_controls, args.gguf_n_ctx)
+                      args.lifebench_lengths, args.lifebench_controls, args.gguf_n_ctx,
+                      args.mmlu_thinking)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 

@@ -65,7 +65,19 @@ evaluate-model ./models/qwen --gpu 0 \
 
 ### MMLU-Pro
 
-使用 LM Evaluation Harness 0.4.13 的原生 `mmlu_pro` 任务和 `TIGER-Lab/MMLU-Pro` 的 `test` split，与当前 Qwen3 评测采用同一 5-shot CoT 配置：从 `validation` 每科取前 5 条示例、文本提示 `Let's think step by step`、不应用 chat template、batch size 1、greedy（`do_sample=False`、`temperature=0`），最多生成 2048 tokens，遇到 `Question:` 停止。按 Harness 的 `exact_match,custom-extract` 解析答案，以有效题数加权汇总 14 科准确率。未显式设置 Qwen3 的 thinking 开关。
+使用 LM Evaluation Harness 0.4.13 的原生 `mmlu_pro` 任务和 `TIGER-Lab/MMLU-Pro` 的 `test` split：全量 12,032 题、14 科；从 `validation` 每科取前 5 个示例；保留官方 CoT 提示，将完整提示作为一条 user 消息套入模型自己的聊天模板；batch size 1。提示 token 上限为 8,192，底层最大上下文为 16,384 tokens（受模型自身上下文限制）。默认 `--mmlu-thinking off`，显式将原生 Thinking 设为关闭，greedy 解码，输出上限 2,048 tokens。对支持原生 Thinking 的模型可传 `--mmlu-thinking on`，显式启用模板中的 Thinking 开关，greedy 解码，输出上限 8,192 tokens；模板的默认 reasoning effort 保持原样（Qwen3-8B 使用模板默认 `xhigh`）。Thinking 模式遇到 `Question:` 时不提前终止，最多仍生成 8,192 tokens；最终只评分 `</think>` 后的回答，缺少闭合标记视为未完成并计错。
+
+解码参数固定为 `do_sample=False`、`temperature=0`、`top_p=1`、`top_k=0`、`min_p=0`、重复惩罚为 1、seed 为 0。HF backend 将 `repeat_penalty` 映射为 `repetition_penalty`；`min_p=0` 在 HF greedy 解码中不传入模型，因为它不改变 greedy 结果。Harness 的官方 `exact_match,custom-extract` 从回答解析 A-J，无法解析计错，按题数汇总准确率。完整评测要求恰好得到 12,032 个有效样本；`--max-samples N` 仅用于小规模检查。输入提示最多使用 8,192 tokens；评测器会检查模型上下文能否同时容纳完整提示和输出上限，超出时直接报错，不静默截断 5-shot 提示。
+
+```bash
+# Thinking off，适用于统一关闭原生 Thinking 的对照
+evaluate-model ./models/qwen --gpu 2 --benchmarks mmlu-pro \
+  --mmlu-thinking off --output results/qwen-mmlu-off.json
+
+# Thinking on，适用于支持该模板开关的模型（如 Qwen3）
+evaluate-model ./models/qwen --gpu 2 --benchmarks mmlu-pro \
+  --mmlu-thinking on --output results/qwen-mmlu-on.json
+```
 
 `--max-samples N` 在 MMLU-Pro 中表示每科最多 N 题；正式全量结果不要使用该选项。
 
@@ -73,7 +85,7 @@ evaluate-model ./models/qwen --gpu 0 \
 
 使用官方 `LIFEBench/LIFEBench` 的 `main` split，默认展开 10 个长度约束（16 到 8192）和 `equal to` 控制方式。固定 `do_sample=False`，按官方指数评分计算 `length_deviation`（绝对百分比）与 `length_score`。可用 `--lifebench-controls "equal to" "at most" "at least"` 运行三种控制方式，或用 `--lifebench-lengths 16 128 1024` 缩小范围。
 
-GGUF 通过 `llama-cpp-python` 使用模型自带 tokenizer，三项 benchmark 均可运行；MMLU-Pro 通过 Harness 原生任务构造题目和评分，GGUF 生成走 llama.cpp，LIFEBench 使用确定性 greedy generation。若要使用 Transformers 的量化 checkpoint，则传入包含 `config.json` 和 tokenizer 文件的模型目录。
+GGUF 通过 `llama-cpp-python` 使用模型自带 tokenizer，三项 benchmark 均可运行；MMLU-Pro 通过 Harness 原生任务构造题目和评分，GGUF 生成走 llama.cpp 并读取 GGUF 内的 `tokenizer.chat_template` 元数据。Thinking on 需要模板支持 `enable_thinking`，否则评测器会报错。若要使用 Transformers 的量化 checkpoint，则传入包含 `config.json` 和 tokenizer 文件的模型目录。
 
 GGUF 默认分配 16384 token context；长输入或长输出模型可用 `--gguf-n-ctx 32768` 调整。`--max-new-tokens` 默认 8192，8192 词约束通常需要更大的生成上限，否则 LIFEBench 长度分数会受到截断影响。
 
