@@ -13,6 +13,9 @@ import json
 import math
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -368,11 +371,26 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
     if gguf_n_ctx < 2:
         raise ValueError("gguf_n_ctx must be >= 2")
     benchmarks = benchmarks or ["wikitext", "mmlu-pro", "lifebench"]
-    model, tokenizer, device, backend = _load_model(model_path, gpu, dtype, gguf_n_ctx)
+    other_benchmarks = [name for name in benchmarks if name.lower().replace("_", "-") != "ifeval"]
+    device = _device(gpu)
     result: dict[str, Any] = {"model": str(Path(model_path).resolve()), "gpu": gpu,
-                              "device": device, "backend": backend, "timestamp": time.time(),
+                              "device": device, "backend": "lm-eval/hf", "timestamp": time.time(),
                               "benchmarks": {}}
-    for benchmark in benchmarks:
+    if len(other_benchmarks) != len(benchmarks):
+        if Path(model_path).suffix.lower() == ".gguf":
+            raise ValueError("IFEval requires a local Transformers model directory")
+        with tempfile.TemporaryDirectory(prefix="quant-eval-ifeval-") as directory:
+            result_path = Path(directory) / "ifeval.json"
+            command = [sys.executable, "-m", "quant_eval.ifeval", model_path,
+                       "--gpu", gpu, "--dtype", dtype, "--output", str(result_path)]
+            if max_samples is not None:
+                command.extend(["--max-samples", str(max_samples)])
+            subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+            result["benchmarks"]["ifeval"] = json.loads(result_path.read_text(encoding="utf-8"))["benchmarks"]["ifeval"]
+    if other_benchmarks:
+        model, tokenizer, device, backend = _load_model(model_path, gpu, dtype, gguf_n_ctx)
+        result["backend"] = backend
+    for benchmark in other_benchmarks:
         key = benchmark.lower().replace("_", "-")
         if key in {"wikitext", "wikitext-2", "ppl"}:
             result["benchmarks"]["wikitext-2-ppl"] = evaluate_wikitext(
@@ -396,7 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("model", help="local Transformers model directory or GGUF file")
     p.add_argument("--gpu", default="0", help="CUDA device id, e.g. 0 or 1; use cpu for CPU")
     p.add_argument("--benchmarks", nargs="+", default=["wikitext", "mmlu-pro", "lifebench"],
-                   choices=["wikitext", "mmlu-pro", "lifebench"])
+                   choices=["wikitext", "mmlu-pro", "lifebench", "ifeval"])
     p.add_argument("--output", "-o", help="JSON result path")
     p.add_argument("--max-samples", type=int)
     p.add_argument("--dtype", choices=["auto", "float16", "bfloat16"] , default="auto")

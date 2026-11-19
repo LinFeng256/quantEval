@@ -12,11 +12,15 @@ dependencies = ["torch>=2.0", "transformers>=4.38", "accelerate>=0.27", "dataset
 [project.optional-dependencies]
 modelscope = ["modelscope>=1.11"]
 gguf = ["llama-cpp-python>=0.2.50"]
+ifeval = ["lm_eval[hf,ifeval]>=0.4.13,<0.5"]
+inference = ["nvidia-ml-py>=12"]
 
 [project.scripts]
 quant-eval = "quant_eval.cli:main"
 download-model = "quant_eval.download:main"
 evaluate-model = "quant_eval.runner:main"
+evaluate-ifeval = "quant_eval.ifeval:main"
+benchmark-inference = "quant_eval.inference:main"
 
 [tool.setuptools.packages.find]
 include = ["quant_eval*"]
