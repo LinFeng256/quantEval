@@ -79,7 +79,8 @@ evaluate-model ./models/qwen --gpu 2 --benchmarks mmlu-pro \
   --mmlu-thinking on --output results/qwen-mmlu-on.json
 ```
 
-`--max-samples N` 在 MMLU-Pro 中表示每科最多 N 题；正式全量结果不要使用该选项。
+`--max-samples N` 在 MMLU-Pro 中表示每科最多 N 题；正式全量结果不要使用该选项。MMLU-Pro 和 IFEval 的全量评测会先用固定回答跑一遍真实 Harness 小样本评分，预检失败就停止，避免开始正式生成。
+评测逐科运行，并在每科完成后将分数原子写入 checkpoint；生成响应同时写入 LM Harness SQLite cache。若进程中断，用相同模型、配置和 `--output` 路径重新启动，会跳过已完成科目，并复用缓存响应继续未完成部分。checkpoint 文件名是 `<output>.mmlu-<off|on>.checkpoint.json`，其中包含每科题数和准确率；运行日志也会在每科完成时输出进度。请保留 checkpoint 和带协议指纹的 SQLite 响应缓存文件（Harness 会追加 `_rank0.db`）以便恢复。Thinking 模式恢复后，若旧缓存无法提供完整的未闭合 `</think>` 计数，`incomplete_thinking` 会标为 `null`；这不影响准确率。
 
 ### LIFEBench
 
@@ -90,6 +91,8 @@ GGUF 通过 `llama-cpp-python` 使用模型自带 tokenizer，三项 benchmark �
 GGUF 默认分配 16384 token context；长输入或长输出模型可用 `--gguf-n-ctx 32768` 调整。`--max-new-tokens` 默认 8192，8192 词约束通常需要更大的生成上限，否则 LIFEBench 长度分数会受到截断影响。
 
 ### IFEval（LM Evaluation Harness）
+
+IFEval 与 MMLU-Pro 一样启用 Harness 的 SQLite 响应缓存。评分失败后，保持模型文件、参数和 `--output` 不变，重新运行会复用已落盘的答案。若在生成阶段中断，只有尚未写入缓存的答案需要重算。结果 JSON 采用原子写入。IFEval 默认将结果和缓存保存到 `results/ifeval/`；指定 `--output` 时缓存与该输出路径关联。合并评测会单独保留 `<output>.ifeval.json` 和对应的缓存，后续评测出错也不会丢掉 IFEval 结果。
 
 ```bash
 # 独立运行；也可用 quant-eval ifeval 或 scripts/evaluate_ifeval.sh
@@ -103,7 +106,14 @@ evaluate-model ./models/qwen --gpu 2 \
 
 使用 Harness 原生 [`ifeval` 任务](https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/ifeval/ifeval.yaml)及 HF backend：完整数据集、0-shot、batch size 1、greedy（`do_sample=False`、`temperature=0`），将 `max_gen_toks` 从任务默认值覆盖为 **4096**。默认应用模型自带 chat template，不传入关闭 Thinking 的参数，也不剥离生成的思考内容；Qwen3 等模型因此遵循自身默认的 Thinking 模式。结果中的 `scores` 保留 Harness 原生的 strict/loose、prompt/instruction 四项指标。思考内容也会进入 Harness 的原生 IFEval 评分，因此请在对比实验中保持相同模板与配置。
 
-IFEval 只支持本地 Transformers checkpoint。`--max-samples` 可用于快速检查，正式结果请省略。合并评测时 IFEval 在独立进程中先运行，避免与其他评测的模型实例同时占用显存。
+IFEval 只支持本地 Transformers checkpoint。`--max-samples` 可用于快速检查，正式结果请省略。评测启动前会检查 NLTK `punkt_tab`；缺失时自动从官方 NLTK 数据仓库下载并校验 SHA-256，再开始加载模型。也可手动运行 `python scripts/download_punkt_tab.py`。合并评测时 IFEval 在独立进程中先运行，避免与其他评测的模型实例同时占用显存。
+
+使用已缓存的数据集在 CPU 上验证真实 Harness 评分与故障恢复：
+
+```bash
+CUDA_VISIBLE_DEVICES='' HF_DATASETS_OFFLINE=1 HF_HUB_OFFLINE=1 \
+  QUANT_EVAL_INTEGRATION=1 python -m unittest tests.test_harness_recovery
+```
 
 ## 推理性能测试
 

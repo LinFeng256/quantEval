@@ -1,4 +1,7 @@
+import json
 import sys
+import tempfile
+from pathlib import Path
 import types
 import unittest
 from types import SimpleNamespace
@@ -22,17 +25,17 @@ SUBJECTS = (
 )
 
 
-def _raw_results():
+def _raw_results(task_name):
+    subject = task_name.removeprefix("mmlu_pro_")
+    index = SUBJECTS.index(subject)
     return {
         "results": {
-            f"mmlu_pro_{subject}": {"exact_match,custom-extract": 1.0 if i == 0 else 0.0}
-            for i, subject in enumerate(SUBJECTS)
+            task_name: {"exact_match,custom-extract": 1.0 if index == 0 else 0.0}
         },
         "n-samples": {
-            f"mmlu_pro_{subject}": {"effective": 2 if i == 0 else 1}
-            for i, subject in enumerate(SUBJECTS)
+            task_name: {"effective": 2 if index == 0 else 1}
         },
-        "versions": {"mmlu_pro_biology": 3.1},
+        "versions": {task_name: 3.1},
     }
 
 
@@ -71,7 +74,7 @@ class MMLUProTests(unittest.TestCase):
 
         def fake_evaluate(**kwargs):
             calls.append(kwargs)
-            return _raw_results()
+            return _raw_results(kwargs["tasks"][0])
 
         tokenizer = SimpleNamespace(chat_template="{% if enable_thinking %}think{% endif %}")
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
@@ -80,7 +83,8 @@ class MMLUProTests(unittest.TestCase):
 
         lm = calls[0]["model"]
         self.assertIsInstance(lm, FakeHFLM)
-        self.assertEqual(calls[0]["tasks"], ["mmlu_pro"])
+        self.assertEqual(calls[0]["tasks"], ["mmlu_pro_biology"])
+        self.assertEqual(len(calls), 14)
         self.assertEqual(calls[0]["batch_size"], 1)
         self.assertTrue(calls[0]["apply_chat_template"])
         self.assertFalse(calls[0]["fewshot_as_multiturn"])
@@ -97,12 +101,45 @@ class MMLUProTests(unittest.TestCase):
         self.assertEqual(result["metric"], "exact_match,custom-extract")
         self.assertEqual(result["thinking"], "off")
 
+    def test_subject_checkpoint_resumes_and_uses_generation_cache(self):
+        calls = []
+        failures = {"mmlu_pro_chemistry"}
+
+        def fake_evaluate(**kwargs):
+            task_name = kwargs["tasks"][0]
+            calls.append(kwargs)
+            if task_name in failures:
+                failures.remove(task_name)
+                raise RuntimeError("simulated interruption")
+            return _raw_results(task_name)
+
+        tokenizer = SimpleNamespace(chat_template="{% if enable_thinking %}think{% endif %}")
+        model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
+        modules = self._harness_modules(fake_evaluate)
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "mmlu.checkpoint.json"
+            with patch.dict(sys.modules, modules):
+                with self.assertRaisesRegex(RuntimeError, "simulated interruption"):
+                    evaluate_mmlu_pro(model, tokenizer, "cuda:2", max_samples=1,
+                                      checkpoint_path=checkpoint, model_id="model-a")
+                partial = json.loads(checkpoint.read_text())
+                self.assertEqual(len(partial["subjects"]), 2)
+                resumed = evaluate_mmlu_pro(model, tokenizer, "cuda:2", max_samples=1,
+                                            checkpoint_path=checkpoint, model_id="model-a")
+
+            self.assertEqual(len(resumed["category_accuracy"]), 14)
+            self.assertEqual(len(calls), 15)
+            self.assertTrue(all(call["use_cache"].startswith(
+                str(checkpoint.with_suffix(".responses.sqlite."))) for call in calls))
+            final = json.loads(checkpoint.read_text())
+            self.assertEqual(final["status"], "completed")
+
     def test_thinking_mode_uses_template_toggle_and_8192_output_cap(self):
         calls = []
 
         def fake_evaluate(**kwargs):
             calls.append(kwargs)
-            return _raw_results()
+            return _raw_results(kwargs["tasks"][0])
 
         tokenizer = SimpleNamespace(chat_template="{% if enable_thinking %}<think>{% endif %}")
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
@@ -120,7 +157,7 @@ class MMLUProTests(unittest.TestCase):
 
     def test_thinking_mode_requires_template_switch(self):
         def fake_evaluate(**kwargs):
-            return _raw_results()
+            return _raw_results(kwargs["tasks"][0])
 
         tokenizer = SimpleNamespace(chat_template="plain chat template")
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
@@ -130,20 +167,22 @@ class MMLUProTests(unittest.TestCase):
 
     def test_full_run_rejects_wrong_test_split_size(self):
         def fake_evaluate(**kwargs):
-            return _raw_results()
+            return _raw_results(kwargs["tasks"][0])
 
         tokenizer = SimpleNamespace(chat_template="plain chat template")
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
-        with patch.dict(sys.modules, self._harness_modules(fake_evaluate)):
+        with patch.dict(sys.modules, self._harness_modules(fake_evaluate)), \
+             patch("quant_eval.mmlu_pro.preflight_scoring") as preflight:
             with self.assertRaisesRegex(RuntimeError, "full MMLU-Pro test split"):
                 evaluate_mmlu_pro(model, tokenizer, "cuda:2")
+        self.assertEqual(len(preflight.call_args.args[0]), 14)
 
     def test_prompt_over_context_fails_before_harness_truncates_it(self):
         captured = []
 
         def fake_evaluate(**kwargs):
             captured.append(kwargs)
-            return _raw_results()
+            return _raw_results(kwargs["tasks"][0])
 
         tokenizer = SimpleNamespace(chat_template="plain chat template")
         model = SimpleNamespace(config=SimpleNamespace(max_position_embeddings=40960))
@@ -157,6 +196,7 @@ class MMLUProTests(unittest.TestCase):
 
     def test_gguf_adapter_uses_native_template_and_scores_after_thinking(self):
         calls = []
+        cached = []
 
         class Formatter:
             template = "{% if enable_thinking %}<think>{% endif %}"
@@ -173,7 +213,7 @@ class MMLUProTests(unittest.TestCase):
                 return handler
 
         class LM:
-            pass
+            cache_hook = SimpleNamespace(add_partial=lambda *args: cached.append(args))
 
         lm_api = types.ModuleType("lm_eval.api")
         lm_model = types.ModuleType("lm_eval.api.model")
@@ -187,6 +227,7 @@ class MMLUProTests(unittest.TestCase):
             lm = _llama_cpp_lm(llama, thinking=True, chat_formatter=formatter)
             request = SimpleNamespace(args=("official CoT question", generation_kwargs(True)))
             self.assertEqual(lm.generate_until([request]), ["Answer is (B)"])
+            self.assertEqual(cached, [("generate_until", request.args, "Answer is (B)")])
 
         self.assertTrue(formatter.kwargs["enable_thinking"])
         self.assertEqual(calls[0]["max_tokens"], 8192)

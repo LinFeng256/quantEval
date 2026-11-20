@@ -13,12 +13,12 @@ import os
 import re
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
 
 from .mmlu_pro import evaluate_mmlu_pro
+from .persistence import atomic_write_json
 
 
 WIKITEXT_CONFIG = {
@@ -296,14 +296,17 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
     if len(other_benchmarks) != len(benchmarks):
         if Path(model_path).suffix.lower() == ".gguf":
             raise ValueError("IFEval requires a local Transformers model directory")
-        with tempfile.TemporaryDirectory(prefix="quant-eval-ifeval-") as directory:
-            result_path = Path(directory) / "ifeval.json"
-            command = [sys.executable, "-m", "quant_eval.ifeval", model_path,
-                       "--gpu", gpu, "--dtype", dtype, "--output", str(result_path)]
-            if max_samples is not None:
-                command.extend(["--max-samples", str(max_samples)])
-            subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
-            result["benchmarks"]["ifeval"] = json.loads(result_path.read_text(encoding="utf-8"))["benchmarks"]["ifeval"]
+        if output:
+            final_path = Path(output).expanduser().resolve()
+            result_path = final_path.with_name(f"{final_path.name}.ifeval.json")
+        else:
+            result_path = Path("results/ifeval") / f"{Path(model_path).resolve().name}.json"
+        command = [sys.executable, "-m", "quant_eval.ifeval", model_path,
+                   "--gpu", gpu, "--dtype", dtype, "--output", str(result_path)]
+        if max_samples is not None:
+            command.extend(["--max-samples", str(max_samples)])
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL)
+        result["benchmarks"]["ifeval"] = json.loads(result_path.read_text(encoding="utf-8"))["benchmarks"]["ifeval"]
     if other_benchmarks:
         model, tokenizer, device, backend = _load_model(model_path, gpu, dtype, gguf_n_ctx)
         result["backend"] = backend
@@ -313,9 +316,18 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
             result["benchmarks"]["wikitext-2-ppl"] = evaluate_wikitext(
                 model, tokenizer, device, backend, max_samples, context_length, stride)
         elif key in {"mmlu", "mmlu-pro"}:
+            mode = mmlu_thinking
+            if output:
+                final_path = Path(output).expanduser().resolve()
+                checkpoint_path = final_path.with_name(
+                    f"{final_path.name}.mmlu-{mode}.checkpoint.json")
+            else:
+                checkpoint_path = Path("results/mmlu_pro") / (
+                    f"{Path(model_path).name}.mmlu-{mode}.checkpoint.json")
             result["benchmarks"]["mmlu-pro"] = evaluate_mmlu_pro(
                 model, tokenizer, device, backend, max_samples,
-                thinking=mmlu_thinking == "on")
+                thinking=mmlu_thinking == "on", checkpoint_path=checkpoint_path,
+                model_id=str(Path(model_path).expanduser().resolve()), dtype=dtype)
         elif key in {"life", "lifebench"}:
             result["benchmarks"]["lifebench"] = evaluate_lifebench(
                 model, tokenizer, device, backend, max_samples, max_new_tokens,
@@ -323,8 +335,7 @@ def evaluate(model_path: str, gpu: str = "0", benchmarks: list[str] | None = Non
         else:
             raise ValueError(f"unknown benchmark: {benchmark}")
     if output:
-        Path(output).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-        Path(output).expanduser().resolve().write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        atomic_write_json(output, result)
     return result
 
 

@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from typing import Any
+
+from .persistence import atomic_write_json, protocol_cache_path
+from .scoring import preflight_scoring
 
 
 MMLU_PROMPT_CONTEXT = 8192
@@ -10,7 +16,13 @@ MMLU_OFF_MAX_TOKENS = 2048
 MMLU_THINKING_MAX_TOKENS = 8192
 MMLU_FULL_TEST_SAMPLES = 12032
 MMLU_STOP = "Question:"
+MMLU_METRIC = "exact_match,custom-extract"
 THINK_END = "</think>"
+MMLU_PRO_SUBJECTS = (
+    "biology", "business", "chemistry", "computer_science", "economics",
+    "engineering", "health", "history", "law", "math", "other",
+    "philosophy", "physics", "psychology",
+)
 
 
 def generation_kwargs(thinking: bool) -> dict[str, Any]:
@@ -86,6 +98,7 @@ def _llama_cpp_lm(llama: Any, thinking: bool = False, chat_formatter: Any = None
 
     class LlamaCppLM(LM):
         def __init__(self):
+            super().__init__()
             self.incomplete_thinking = 0
 
         def loglikelihood(self, requests):
@@ -139,6 +152,7 @@ def _llama_cpp_lm(llama: Any, thinking: bool = False, chat_formatter: Any = None
                         text = _thinking_answer(text)
                 else:
                     text = text.split(MMLU_STOP, 1)[0]
+                self.cache_hook.add_partial("generate_until", request.args, text)
                 responses.append(text)
             return responses
 
@@ -225,9 +239,11 @@ def _hf_lm(model: Any, tokenizer: Any, thinking: bool):
 def evaluate_mmlu_pro(model: Any, tokenizer: Any, device: str,
                       backend: str = "transformers",
                       max_samples: int | None = None,
-                      thinking: bool = False) -> dict[str, Any]:
+                      thinking: bool = False,
+                      checkpoint_path: str | Path | None = None,
+                      model_id: str | None = None, dtype: str = "auto") -> dict[str, Any]:
     try:
-        from lm_eval import simple_evaluate
+        import lm_eval
     except ImportError as exc:
         raise RuntimeError("MMLU-Pro requires LM Evaluation Harness") from exc
 
@@ -256,53 +272,115 @@ def evaluate_mmlu_pro(model: Any, tokenizer: Any, device: str,
             f"{gen_kwargs['max_gen_toks']}-token output budget and a prompt"
         )
 
-    raw = simple_evaluate(
-        model=lm,
-        tasks=["mmlu_pro"],
-        batch_size=1,
-        apply_chat_template=apply_chat_template,
-        fewshot_as_multiturn=False,
-        gen_kwargs=gen_kwargs,
-        limit=max_samples,
-        log_samples=False,
-        random_seed=0,
-        numpy_random_seed=0,
-        torch_random_seed=0,
-        fewshot_random_seed=0,
+    checkpoint = Path(checkpoint_path).expanduser().resolve() if checkpoint_path else None
+    protocol = {
+        "model": model_id,
+        "dtype": dtype,
+        "context": max_sequence_length,
+        "harness": getattr(lm_eval, "__version__", None),
+        "thinking": "on" if thinking else "off",
+        "backend": backend,
+        "max_samples_per_subject": max_samples,
+        "generation_kwargs": gen_kwargs,
+        "apply_chat_template": apply_chat_template,
+        "num_fewshot": 5,
+        "subjects": list(MMLU_PRO_SUBJECTS),
+    }
+    cache_path = (
+        protocol_cache_path(checkpoint.with_suffix(".responses.sqlite"), protocol)
+        if checkpoint else None
     )
-    if raw is None:
-        raise RuntimeError("LM Evaluation Harness returned no MMLU-Pro result")
+    cache_db = Path(f"{cache_path}_rank{int(os.getenv('LOCAL_RANK', '0'))}.db") if cache_path else None
+    resumed = cache_db is not None and cache_db.exists()
+    state: dict[str, Any] = {"status": "running", "protocol": protocol, "subjects": {}}
+    if checkpoint and checkpoint.exists():
+        try:
+            state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"MMLU-Pro checkpoint is unreadable: {checkpoint}") from exc
+        if state.get("protocol") != protocol:
+            raise RuntimeError(
+                f"MMLU-Pro checkpoint protocol does not match this run: {checkpoint}. "
+                "Choose a new output path to start a separate evaluation."
+            )
+        if state.get("status") == "completed" and isinstance(state.get("benchmark"), dict):
+            return state["benchmark"]
+        if not isinstance(state.get("subjects"), dict):
+            raise RuntimeError(f"MMLU-Pro checkpoint has no subject results: {checkpoint}")
 
-    scores = raw.get("results", {})
-    counts = raw.get("n-samples", {})
-    categories: dict[str, float] = {}
-    total = 0
-    weighted = 0.0
-    for task, values in scores.items():
-        if not task.startswith("mmlu_pro_"):
+    if max_samples is None:
+        pending = {f"mmlu_pro_{subject}": (MMLU_METRIC,) for subject in MMLU_PRO_SUBJECTS
+                   if f"mmlu_pro_{subject}" not in state["subjects"]}
+        if pending:
+            preflight_scoring(pending, "Reasoning. The answer is (A).")
+
+    scored_now = 0
+    for subject in MMLU_PRO_SUBJECTS:
+        task_name = f"mmlu_pro_{subject}"
+        if task_name in state["subjects"]:
             continue
-        score = values.get("exact_match,custom-extract")
-        count = counts.get(task, {}).get("effective")
+        kwargs = {
+            "model": lm,
+            "tasks": [task_name],
+            "batch_size": 1,
+            "apply_chat_template": apply_chat_template,
+            "fewshot_as_multiturn": False,
+            "gen_kwargs": gen_kwargs,
+            "limit": max_samples,
+            "log_samples": False,
+            "random_seed": 0,
+            "numpy_random_seed": 0,
+            "torch_random_seed": 0,
+            "fewshot_random_seed": 0,
+        }
+        if cache_path:
+            kwargs["use_cache"] = str(cache_path)
+        raw = lm_eval.simple_evaluate(**kwargs)
+        if raw is None:
+            raise RuntimeError(f"LM Evaluation Harness returned no MMLU-Pro result for {subject}")
+        values = raw.get("results", {}).get(task_name, {})
+        score = values.get(MMLU_METRIC)
+        count = raw.get("n-samples", {}).get(task_name, {}).get("effective")
         if score is None or count is None:
-            raise RuntimeError(f"MMLU-Pro result is missing score or sample count: {task}")
-        categories[task.removeprefix("mmlu_pro_")] = score
-        weighted += score * count
-        total += count
-    if len(categories) != 14 or total == 0:
-        raise RuntimeError(f"Expected 14 MMLU-Pro subjects, got {len(categories)}")
+            raise RuntimeError(f"MMLU-Pro result is missing score or sample count: {task_name}")
+        state["subjects"][task_name] = {
+            "subject": subject,
+            "accuracy": float(score),
+            "samples": int(count),
+            "task_version": raw.get("versions", {}).get(task_name),
+        }
+        scored_now += 1
+        state["status"] = "running"
+        if checkpoint:
+            atomic_write_json(checkpoint, state)
+        print(
+            f"[MMLU-Pro] checkpoint {len(state['subjects'])}/{len(MMLU_PRO_SUBJECTS)}: "
+            f"{subject} accuracy={score:.6f} samples={count}",
+            flush=True,
+        )
+
+    subjects = state["subjects"]
+    if set(subjects) != {f"mmlu_pro_{subject}" for subject in MMLU_PRO_SUBJECTS}:
+        raise RuntimeError(f"MMLU-Pro checkpoint is missing one or more subjects: {checkpoint}")
+    categories = {name.removeprefix("mmlu_pro_"): values["accuracy"]
+                  for name, values in subjects.items()}
+    total = sum(values["samples"] for values in subjects.values())
     if max_samples is None and total != MMLU_FULL_TEST_SAMPLES:
         raise RuntimeError(
             f"Expected the full MMLU-Pro test split ({MMLU_FULL_TEST_SAMPLES} questions), got {total}"
         )
-
-    incomplete = getattr(lm, "incomplete_thinking", 0)
-    return {
+    if total == 0:
+        raise RuntimeError("MMLU-Pro returned zero scored samples")
+    weighted = sum(values["accuracy"] * values["samples"] for values in subjects.values())
+    # Cached text is the scorer input; it doesn't record whether </think> was found.
+    incomplete = None if thinking and (resumed or len(subjects) > scored_now) else lm.incomplete_thinking
+    benchmark = {
         "dataset": "TIGER-Lab/MMLU-Pro",
         "split": "test",
         "method": "5-shot CoT generation",
         "backend": "lm-eval/hf" if backend == "transformers" else "llama.cpp",
         "task": "mmlu_pro",
-        "task_version": raw.get("versions", {}).get("mmlu_pro_biology"),
+        "task_version": subjects.get("mmlu_pro_biology", {}).get("task_version"),
         "num_fewshot": 5,
         "fewshot_split": "validation",
         "fewshot_sampler": "first_n per subject",
@@ -323,8 +401,17 @@ def evaluate_mmlu_pro(model: Any, tokenizer: Any, device: str,
             "min_p": 0.0,
         },
         "incomplete_thinking": incomplete,
-        "metric": "exact_match,custom-extract",
+        "metric": MMLU_METRIC,
         "samples": total,
         "accuracy": weighted / total,
         "category_accuracy": dict(sorted(categories.items())),
+        "category_samples": {subject: subjects[f"mmlu_pro_{subject}"]["samples"]
+                             for subject in MMLU_PRO_SUBJECTS},
+        "checkpoint": str(checkpoint) if checkpoint else None,
+        "generation_cache": str(cache_db) if cache_db else None,
     }
+    state["status"] = "completed"
+    state["benchmark"] = benchmark
+    if checkpoint:
+        atomic_write_json(checkpoint, state)
+    return benchmark
